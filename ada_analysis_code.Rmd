@@ -1,0 +1,576 @@
+---
+title: "ada_final_project"
+author: "MK NYARKO"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, Installing Packages}
+
+install.packages(c("tidyverse","survey","srvyr","haven","janitor","broom","broom.helpers",
+                   "car","finalfit","DescTools","questionr","knitr","kableExtra","ResourceSelection"))
+```
+
+```{r, Loading libraries}
+
+library(tidyverse)     # dplyr, ggplot2, etc.
+library(haven)         # read SAS XPT / Stata files
+library(survey)        # survey-weighted models & design
+library(srvyr)         # dplyr-like interface for survey objects
+library(janitor)       # clean_names()
+library(broom)         # tidy() model output
+library(broom.helpers) # extras for tidy
+library(car)           # VIF, BoxTidwell
+library(finalfit)      # quick tables
+library(DescTools)     # Hosmer-Lemeshow (non-survey)
+library(questionr)     # weighted tables
+library(knitr)
+library(kableExtra)
+library(splines)        # to fix non linearity of age
+library(ResourceSelection)  # Unweighted Hosmer-Lemeshow
+library(ggplot2)        #for standardized residuals
+library(data.table)     #to write the analytical dataset to csv file
+
+```
+
+```{r, Reading the BRFSS 2022 Data}
+
+brfss_raw <- read_xpt("/Users/mknyarko/Documents/COURSES BROWN SCHOOL/YEAR 2/ADA/THE PROJECT/LLCP2022.XPT")
+
+# Quick check
+names(brfss_raw) 
+```
+```{r, Cleaning and checking new names after clean names}
+brfss_raw %>% 
+  clean_names() %>% 
+  names()
+```
+
+```{r, Selecting required variables}
+
+brfss_clean <- brfss_raw %>%
+  clean_names() %>%     
+  
+  transmute(
+    #Outcome: Poor mental health
+    menthlth = menthlth,
+    fmd = case_when(
+      menthlth >= 14 ~ 1,
+      menthlth < 14 ~ 0,
+      TRUE ~ NA_real_
+    ),
+
+    #Exposure: Smoking
+    smoking = case_when(
+      smokday2 %in% c(1, 2) ~ 1,   # current smoker
+      smokday2 == 3 ~ 0,           # non-smoker
+      TRUE ~ NA_real_
+    ),
+
+    #Age
+    age = age80,       
+
+    #Sex
+    sex = case_when(
+      sex == 1 ~ "Male",
+      sex == 2 ~ "Female",
+      TRUE ~ NA_character_
+    ),
+
+    # Race
+    race = case_when(
+      race1 == 1 ~ "White, non-Hispanic",
+      race1 == 2 ~ "Black, non-Hispanic",
+      race1 == 3 ~ "Asian, non-Hispanic",
+      race1 == 4 ~ "NH/PI",
+      race1 == 5 ~ "AI/AN",
+      race1 == 6 ~ "Other race",
+      race1 == 7 ~ "Multiracial",
+      race1 == 8 ~ "Hispanic",
+      TRUE ~ NA_character_
+    ),
+
+    #Education
+    educ = case_when(
+      educag == 1 ~ "Did not graduate HS",
+      educag == 2 ~ "HS graduate",
+      educag == 3 ~ "Some college",
+      educag == 4 ~ "College graduate",
+      TRUE ~ NA_character_
+    ),
+
+    #Income
+    income = case_when(
+      incomg1 == 1 ~ "<$25,000",
+      incomg1 == 2 ~ "$25,000–$49,999",
+      incomg1 == 3 ~ "$50,000–$74,999",
+      incomg1 == 4 ~ "$75,000+",
+      TRUE ~ NA_character_
+    ),
+
+    #Survey design variables
+    weight = llcpwt,
+    strata = ststr,
+    psu = psu
+  ) %>%
+
+  filter(
+    !is.na(fmd),
+    !is.na(smoking),
+    age >= 18
+  )
+
+summary(brfss_clean)
+```
+```{r, checking for missingness}
+colSums(is.na(brfss_clean))
+```
+
+```{r}
+brfss_clean %>%
+  summarise(
+    missing_fmd = sum(is.na(fmd)),
+    missing_smoking = sum(is.na(smoking)),
+    missing_age = sum(is.na(age)),
+    missing_sex = sum(is.na(sex)),
+    missing_race = sum(is.na(race)),
+    missing_educ = sum(is.na(educ)),
+    missing_income = sum(is.na(income))
+  )
+
+```
+
+```{r, Removing missing entries for income variable}
+brfss_clean1 <- brfss_clean %>%
+  filter(!is.na(income))
+
+colSums(is.na(brfss_clean1))
+```
+
+```{r, Removing missing entries for race variable}
+brfss_clean2 <- brfss_clean1 %>%
+  filter(!is.na(race))
+
+colSums(is.na(brfss_clean2))
+```
+
+```{r, Removing missing entries for education variable}
+brfss_clean3 <- brfss_clean2 %>%
+  filter(!is.na(educ))
+
+colSums(is.na(brfss_clean3))
+
+```
+
+```{r, Checking distribution in fmd}
+table(brfss_clean3$fmd)
+
+```
+```{r, Writing the analytical dataset}
+
+fwrite(brfss_clean3, "brfss_clean_ada.csv")
+```
+
+
+
+
+#ANALYSIS PHASE
+
+```{r, Creating the survey design object}
+# BRFSS is a complex survey: weights, strata, and PSU must be set so the results from analysis are generalizable to the US population
+
+# Fix lonely PSUs before design 
+options(survey.lonely.psu = "adjust")
+
+#Survey design for BRFSS
+brfss_svy <- svydesign(
+  ids = ~psu,
+  strata = ~strata,
+  weights = ~weight,
+  nest = TRUE,
+  data = brfss_clean3
+)
+```
+
+#Weighted Descriptive Statistics
+```{r}
+
+# Function to get weighted n and percent
+get_weighted_table <- function(var){
+  dist <- svytable(as.formula(paste0("~", var)), brfss_svy)
+  pct  <- prop.table(dist) * 100
+  
+  tibble(
+    variable = var,
+    category = names(dist),
+    n_unweighted = as.numeric(dist),
+    pct_weighted = as.character(round(as.numeric(pct), 1))   # <-- FORCE CHARACTER
+  )
+}
+
+# Key categorical variables
+vars <- c("fmd", "smoking", "sex", "race", "educ", "income")
+
+# Apply function to each variable
+desc_cat <- map_df(vars, get_weighted_table)
+
+# Weighted age statistics
+mean_age <- svymean(~age, brfss_svy, na.rm = TRUE)
+sd_age   <- sqrt(attr(mean_age, "var"))
+
+age_stats <- tibble(
+  variable = "age",
+  category = "Mean (SD)",
+  n_unweighted = nrow(brfss_clean3),
+  pct_weighted = paste0(
+    round(as.numeric(mean_age), 1),
+    " (",
+    round(as.numeric(sd_age), 1),
+    ")"
+  )   # character output — perfect
+)
+
+# Final combined table
+descriptives_table <- bind_rows(desc_cat, age_stats)
+
+descriptives_table
+
+```
+#Weighted prevalence of poor mental health & smoking
+```{r}
+# Weighted prevalence (proportions) with 95% CI
+
+# FMD prevalence (fmd = 1)
+fmd_prev <- svymean(~factor(fmd), design = brfss_svy, na.rm = TRUE)
+fmd_prev                 # prints proportions for fmd=0 and fmd=1
+confint(fmd_prev)        # 95% CIs
+
+# Smoking prevalence (smoking = 1 current smoker)
+smk_prev <- svymean(~factor(smoking), design = brfss_svy, na.rm = TRUE)
+smk_prev
+confint(smk_prev)
+
+# Nicely formatted table for reporting
+prop_table <- function(varname) {
+  tt <- svytable(as.formula(paste0("~", varname)), brfss_svy)
+  pct <- prop.table(tt) * 100
+  tibble::tibble(
+    category = names(tt),
+    unweighted_n = as.numeric(tt),
+    weighted_pct = round(as.numeric(pct), 1)
+  )
+}
+
+prop_table("fmd")
+prop_table("smoking")
+
+```
+#Weighted logistic regression model (main adjusted model)
+
+```{r, Weighted Logistic regression model}
+# Survey-weighted logistic regression (fully adjusted model)
+model_adj <- svyglm(
+  fmd ~ smoking + age + sex + race + educ + income,
+  design = brfss_svy,
+  family = quasibinomial()   # quasibinomial commonly used with svyglm
+)
+
+summary(model_adj)
+
+```
+
+#Testing the Assumptions
+
+#Linearity in the logit (Box-Tidwell test)
+```{r}
+# For logistic regression, continuous predictors must have a linear relationship with the logit of the outcome.
+# BRFSS continuous predictor = age
+# Survey methods do not support Box–Tidwell directly, so approximation was made using unweighted glm for the linearity check only.
+#This is accepted because linearity relates to functional form, not estimation precision.
+
+
+# Create interaction term age * log(age)
+brfss_clean3$age_log <- log(brfss_clean3$age)
+
+box_tidwell_model <- glm(
+  fmd ~ smoking + age + I(age * age_log) + sex + race + educ + income,
+  family = binomial(),
+  data = brfss_clean3
+)
+
+summary(box_tidwell_model)
+
+```
+With the p-value of the coefficient for I(age * age_log) <0.05 (3.14e-08), age variable does not have a linear relationship with the logit of fmd.
+Age variable failed the linearity test.
+Age was replaced with splines in the model to fix this.
+
+```{r, Replacing age with Splines in the regression model}
+
+model_adj <- svyglm(
+  fmd ~ smoking + ns(age, df=3) + sex + race + educ + income,
+  design = brfss_svy,
+  family = quasibinomial()
+)
+
+summary(model_adj)
+```
+Smoking
+Estimate = 0.004, p = 0.914
+After adjusting for demographics and socioeconomic status, current smoking is not independently associated with frequent mental distress.
+
+Age (Spline terms: ns(age, df = 3))
+All three spline terms are highly significant, all p < 0.000001.
+Age has a statistically significant non-linear association with frequent mental distress, indicating that mental distress varies across age in a complex, non-linear pattern.
+
+Sex
+Male vs. Female:
+Estimate = 0.318, p < 0.0001
+Exponentiating gives:
+OR ≈ exp(0.318) ≈ 1.37
+Males have 37% higher odds of frequent mental distress than females, adjusting for age, smoking, race, education, and income.
+
+Race
+None of the race categories are significant (all p > 0.05).
+Race is not independently associated with frequent mental distress once socioeconomic and demographic factors are controlled for.
+
+Education
+Category	                 Estimate	         Meaning
+Did not graduate HS	       0.41	             Higher odds of FMD
+HS graduate	               0.35	             Higher odds
+Some college	             0.08	             not significant
+
+Exponentiated:
+Did not graduate HS → OR ~1.51
+HS graduate → OR ~1.42
+
+Interpretation:
+Individuals with lower education have substantially higher odds of frequent mental distress, showing a strong socioeconomic gradient.
+
+Income
+Income group	        Estimate	        OR	        Interpretation
+$25–49k	              –0.140	         ~0.87	      marginal significance
+$50–74k	              –0.212	         ~0.81	      significant
+≥$75k	                –0.199	         ~0.82	      significant
+
+Interpretation:
+Higher income is associated with lower odds of frequent mental distress, with those earning ≥ USD75,000 having roughly 18–20% lower odds compared with those earning < USD25,000.
+
+
+#Multicollinearity (VIF)
+```{r}
+# Unweighted glm was run using the same predictors, as VIF is not valid for survey-weighted logistic regression.
+
+glm_vif <- glm(
+  fmd ~ smoking + age + sex + race + educ + income,
+  family = binomial(),
+  data = brfss_clean3
+)
+
+car::vif(glm_vif)
+
+```
+There is no concerning multicollinearity among smoking, age, sex, race, education, and income as all results are close to 1 and <5.
+The regression estimates are therefore stable and reliable with respect to multicollinearity.
+No need to remove or transform any variables due to collinearity.
+
+#Goodness-of-fit (Hosmer–Lemeshow)
+```{r}
+# The Hosmer–Lemeshow test is NOT valid for survey-weighted logistic models (Lumley 2021).
+# Unweighted Hosmer–Lemeshow test was used to get approximate estimates
+
+glm_unweighted <- glm(
+  fmd ~ smoking + age + sex + race + educ + income,
+  family = binomial(),
+  data = brfss_clean3
+)
+
+hoslem.test(glm_unweighted$y, fitted(glm_unweighted), g = 10)
+
+```
+Since p-value < 0.05, the model fit is approximately poor.
+Reasons such as limited covariates to be explained in write-up
+
+
+#Influential observations (Cook’s Distance)
+```{r}
+#There is no valid Cook’s distance for survey-weighted models.
+#However, influence diagnostics was run on unweighted logistic regression to detect data errors, not to drop real BRFSS values.
+
+cooks <- cooks.distance(glm_unweighted)
+
+plot(cooks, type = "h")
+abline(h = 4/length(cooks), col = "red")
+
+```
+The Cook’s Distance values for the logistic regression model were all extremely small (<0.001), with none approaching levels typically considered influential (e.g., Cook’s D > 1).
+Although a substantial number of observations exceeded the very small 4/n threshold due to the large sample size (~60,000), none of the values indicate meaningful influence.
+Therefore, there is no evidence of influential observations affecting model stability.
+
+#Outlier checks
+
+#1. Standardized residuals
+```{r}
+
+glm_unweighted$residuals_std <- rstandard(glm_unweighted)
+
+ggplot(data.frame(resid = glm_unweighted$residuals_std),
+       aes(x = resid)) +
+  geom_histogram()
+
+```
+Values beyond ±3 indicates outliers
+No such values from the histogram.
+
+The histogram of logistic regression residuals shows the expected bimodal pattern, with one cluster for observations with outcome 0 (positive residuals) and another cluster for observations with outcome 1 (negative residuals). This distribution is typical for logistic models and does not indicate a violation of assumptions. The asymmetry reflects the imbalance in the outcome variable.
+
+#2. Checking unusual age values
+```{r}
+summary(brfss_clean3$age)
+
+```
+
+No unusual age entry detected
+
+#3. Checking for impossible values in smoking
+```{r}
+table(brfss_clean3$smoking, useNA = "ifany")
+
+```
+No unusual values for smoking variable.
+
+#Adjusted odds ratios (aORs) & 95% CI table
+```{r}
+
+# Tidy table of coefficients with exponentiated ORs & CIs
+tidy_or <- broom::tidy(model_adj, conf.int = TRUE, exponentiate = TRUE)
+# keep only main terms (optional)
+tidy_or %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(OR = estimate, lower_CI = conf.low, upper_CI = conf.high)
+
+```
+Interpretation:
+ - After adjustment for covariates, smoking was not significantly associated with fmd (OR = 1.00, 95% CI 0.93–1.09). 
+ - Age showed a strong and statistically significant non-linear relationship with the outcome (all spline terms p < 0.000001). 
+ - Male respondents had significantly higher odds of fmd compared with females (OR = 1.37, 95% CI 1.27–1.49). 
+ - Race was not significantly associated with fmd after adjustment.
+ - Lower educational attainment was associated with higher odds of fmd, with those who did not graduate high school having 51% higher odds compared with college      graduates (OR = 1.51, 95% CI 1.31–1.75). 
+ - Income was inversely associated with fmd, with individuals earning ≥ USD 75,000 demonstrating approximately 18% lower odds compared with those earning 
+ < USD 25,000 (OR = 0.82, 95% CI 0.73–0.93).
+
+#Effect modification (interaction) by sex or race (test + stratified results)
+```{r}
+# Interaction with sex
+model_int_sex <- svyglm(
+  fmd ~ smoking * sex + age + race + educ + income,
+  design = brfss_svy,
+  family = quasibinomial()
+)
+summary(model_int_sex)   # inspect smoking:sex interaction term p-value
+
+# If interaction p < 0.05, compute stratified models:
+model_male <- svyglm(fmd ~ smoking + age + race + educ + income,
+                     design = subset(brfss_svy, sex == "Male"),
+                     family = quasibinomial())
+
+model_female <- svyglm(fmd ~ smoking + age + race + educ + income,
+                       design = subset(brfss_svy, sex == "Female"),
+                       family = quasibinomial())
+
+# Get ORs for smoking from stratified models
+broom::tidy(model_male, conf.int = TRUE, exponentiate = TRUE) %>% filter(term == "smoking")
+broom::tidy(model_female, conf.int = TRUE, exponentiate = TRUE) %>% filter(term == "smoking")
+
+
+# Interaction with race (example using 4-level race; if many levels, consider collapsing)
+model_int_race <- svyglm(
+  fmd ~ smoking * race + age + sex + educ + income,
+  design = brfss_svy,
+  family = quasibinomial()
+)
+summary(model_int_race)
+
+```
+1. Smoking × Sex Interaction
+The interaction term smoking:sexMale is statistically significant:
+β = –0.269, SE = 0.080, p = 0.00082
+
+Interpretation:
+The association between smoking and FMD differs significantly between males and females.
+
+Among females, the smoking effect is positive (β = +0.109, p = 0.043), meaning smoking is slightly associated with higher odds of FMD.
+
+Among males, the smoking effect is:
+0.109 + (–0.269) = –0.160, which corresponds to a negative association.
+
+Smoking is associated with higher odds of FMD in females but lower odds in males.
+
+Stratification
+A. Male respondents
+
+Smoking effect (males only):
+OR = 0.89
+95% CI = 0.79 – 1.01
+p = 0.066
+
+Interpretation
+Among men, current smoking is associated with 11% lower odds of frequent mental distress compared with non-smokers, 
+
+but:
+The confidence interval includes 1.00
+The p-value is slightly above 0.05
+
+This is not statistically significant, though it is borderline.
+
+Hence:
+For men, smoking does not appear to be significantly associated with frequent mental distress, although the trend suggests slightly lower distress among male smokers.
+
+
+B. Female respondents
+
+Smoking effect (females only):
+OR = 1.07
+95% CI = 0.96 – 1.19
+p = 0.210
+
+Interpretation
+Among women, smokers have 7% higher odds of frequent mental distress compared with nonsmokers, 
+
+but:
+The confidence interval includes 1.00
+The association is not statistically significant
+
+No significant association between smoking and distress among women.
+
+Hence:
+For women, smoking is not significantly associated with frequent mental distress, although the point estimate suggests a slight positive association.
+
+
+Smoking × Race Interaction
+
+None of the smoking × race interaction terms reach p < 0.05, but several fall in the borderline range:
+
+Black, non-Hispanic: p = 0.072
+Hispanic: p = 0.058
+NH/PI: p = 0.073
+Asian: p = 0.117
+White: p = 0.114
+
+However:
+Estimates consistently trend negative (coefficients –0.84 to –1.20), suggesting the smoking effect may be weaker among racial minority groups compared to the reference.
+
+There is no statistically significant race-based effect modification, although results suggest potential differences that may warrant further investigation with larger samples or pooled BRFSS years.
+
+
+
+
+
+
+
+
+
